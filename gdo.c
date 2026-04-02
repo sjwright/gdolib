@@ -17,7 +17,10 @@
 
 #include "secplus.h"
 #include "gdo_priv.h"
+#include "gdo_esphome_log_bridge.h"
+#include <stdio.h>
 #include <string.h>
+#include <esp_rom_sys.h>
 
 #define __STDC_FORMAT_MACROS 1
 #include <inttypes.h>
@@ -119,6 +122,12 @@ static portMUX_TYPE gdo_spinlock = portMUX_INITIALIZER_UNLOCKED;
 esp_err_t gdo_init(const gdo_config_t *config) {
     esp_err_t err = ESP_OK;
 
+    // Hardcoded tag to avoid any ambiguity around `TAG` variable usage.
+    // This should appear once at boot if gdolib is linked and gdo_init() runs.
+    // Force-enable gdolib tag output in case ESPHome config/log forwarding muted it.
+    esp_log_level_set("gdolib", ESP_LOG_VERBOSE);
+    esp_log_level_set(TAG, ESP_LOG_VERBOSE);
+    
     if (!config || config->uart_num >= UART_NUM_MAX ||
         config->uart_tx_pin >= GPIO_NUM_MAX || config->uart_rx_pin >= GPIO_NUM_MAX) {
         return ESP_ERR_INVALID_ARG;
@@ -336,6 +345,8 @@ esp_err_t gdo_start(gdo_event_callback_t event_callback, void *user_arg) {
     }
 
     g_event_callback = event_callback;
+    // Hardcoded tag to confirm gdolib start path is executing.
+    ESP_LOGE("gdolib", "DEBUG: gdo_start() completed gdo_sync()");
     ESP_LOGI(TAG, "GDO Started");
     return err;
 }
@@ -1352,10 +1363,13 @@ static void decode_packet(uint8_t *packet) {
     data &= ~0xf000;
 
     if ((fixed & 0xFFFFFFFF) == g_status.client_id) { // my commands
-        ESP_LOGE(TAG, "received mine: rolling=%07" PRIx32 " fixed=%010" PRIx64 " data=%08" PRIx32, rolling, fixed, data);
+        gdolib_esphome_log_e(TAG,
+                             "received mine: rolling=%07" PRIx32 " fixed=%010" PRIx64 " data=%08" PRIx32,
+                             rolling, fixed, data);
         return;
     } else {
-        ESP_LOGI(TAG, "received rolling=%07" PRIx32 " fixed=%010" PRIx64 " data=%08" PRIx32, rolling, fixed, data);
+        gdolib_esphome_log_i(TAG, "received rolling=%07" PRIx32 " fixed=%010" PRIx64 " data=%08" PRIx32,
+                             rolling, fixed, data);
     }
 
     gdo_command_t cmd = ((fixed >> 24) & 0xf00) | (data & 0xff);
@@ -1363,7 +1377,8 @@ static void decode_packet(uint8_t *packet) {
     uint8_t byte1 = (data >> 16) & 0xff;
     uint8_t byte2 = (data >> 24) & 0xff;
 
-    ESP_LOGI(TAG, "cmd=%03x (%s) byte2=%02x byte1=%02x nibble=%01x", cmd, cmd_to_string(cmd), byte2, byte1, nibble);
+    gdolib_esphome_log_i(TAG, "cmd=%03x (%s) byte2=%02x byte1=%02x nibble=%01x",
+                         cmd, cmd_to_string(cmd), byte2, byte1, nibble);
 
     if (cmd == GDO_CMD_STATUS) {
         update_door_state((gdo_door_state_t)nibble);
@@ -1428,6 +1443,85 @@ static void decode_packet(uint8_t *packet) {
     }
 }
 
+/** Sec+ v2 UART wireline frame: 0x55 0x01 0x00 + 16 decoded bytes (see decode_wireline). */
+#define GDO_V2_WIRELINE_FRAME_BYTES 19U
+
+/** Min time between GET_STATUS after undecodable oversized v2 RX (limits TX queue spam). */
+#define GDO_V2_GARBAGE_GET_STATUS_INTERVAL_US (3ULL * 1000 * 1000)
+
+/** Last esp_timer time we queued GET_STATUS after garbage oversized chunk (0 = never). */
+static uint64_t g_v2_last_garbage_get_status_us;
+
+static void log_oversized_v2_chunk_hex(const uint8_t *buf, uint16_t len) {
+    gdolib_esphome_log_w(TAG, "Oversized v2 chunk full dump (%u bytes):", (unsigned)len);
+    for (uint16_t off = 0; off < len; off += 16) {
+        char line[16 * 3 + 2];
+        uint16_t pos = 0;
+        uint16_t chunk = (uint16_t)(len - off);
+        if (chunk > 16) {
+            chunk = 16;
+        }
+        for (uint16_t k = 0; k < chunk && pos + 4 < sizeof(line); k++) {
+            int n = snprintf(line + pos, sizeof(line) - pos, "%02X ", buf[off + k]);
+            if (n <= 0) {
+                break;
+            }
+            pos += (uint16_t)n;
+        }
+        gdolib_esphome_log_i(TAG, "  %04X  %s", (unsigned)off, line);
+    }
+}
+
+/**
+ * Read one UART_DATA blob that is longer than a single v2 frame: log it in full, scan for
+ * 55 01 00 + 16 payload bytes, validate with decode_wireline, forward via decode_packet.
+ * If nothing decodes, flush RX and clear rx_pending.
+ */
+static void process_oversized_v2_chunk(uint8_t *buf, uint16_t n, uint8_t *rx_pending) {
+    uint8_t decoded_count = 0;
+
+    log_oversized_v2_chunk_hex(buf, n);
+
+    uint16_t i = 0;
+    while (i + GDO_V2_WIRELINE_FRAME_BYTES <= n) {
+        if (buf[i] != 0x55 || buf[i + 1] != 0x01 || buf[i + 2] != 0x00) {
+            i++;
+            continue;
+        }
+        uint32_t rolling = 0;
+        uint64_t fixed = 0;
+        uint32_t data = 0;
+        if (decode_wireline(&buf[i], &rolling, &fixed, &data) != 0) {
+            i++;
+            continue;
+        }
+        print_buffer(g_status.protocol, &buf[i], false);
+        decode_packet(&buf[i]);
+        decoded_count++;
+        if (*rx_pending > 0) {
+            (*rx_pending)--;
+        }
+        i += GDO_V2_WIRELINE_FRAME_BYTES;
+    }
+
+    if (decoded_count == 0) {
+        gdolib_esphome_log_w(TAG,
+                             "Oversized v2 chunk: no decodable frame; flushing UART RX and clearing rx_pending");
+        uart_flush_input(g_config.uart_num);
+        *rx_pending = 0;
+
+        uint64_t now_us = esp_timer_get_time();
+        if (g_v2_last_garbage_get_status_us == 0 ||
+            now_us - g_v2_last_garbage_get_status_us >= GDO_V2_GARBAGE_GET_STATUS_INTERVAL_US) {
+            g_v2_last_garbage_get_status_us = now_us;
+            esp_err_t gst = get_status();
+            if (gst != ESP_OK) {
+                gdolib_esphome_log_d(TAG, "GET_STATUS after garbled v2 RX failed: %s", esp_err_to_name(gst));
+            }
+        }
+    }
+}
+
 /**
  * @brief Main task that handles all the events from the UART and other tasks.
 */
@@ -1440,20 +1534,35 @@ static void gdo_main_task(void* arg) {
     gdo_cb_event_t cb_event = GDO_CB_EVENT_MAX;
     esp_err_t err = ESP_OK;
     uint32_t last_tx_time = 0;
+    // Limited high-signal logging to confirm we are seeing UART frames and framing boundaries.
+    // Keep these as ESP_LOGE + counters so they're not affected by per-tag log level tweaks.
+    uint32_t dbg_uart_break_seen = 0;
+    uint32_t dbg_uart_data_seen = 0;
+    uint32_t dbg_v2_sig_ok = 0;
+    uint32_t dbg_v2_sig_err = 0;
+    uint64_t last_hb_us = 0;
 
     for (;;) {
-        if (xQueueReceive(gdo_event_queue, (void*)&event, (TickType_t)portMAX_DELAY)) {
+        if (xQueueReceive(gdo_event_queue, (void*)&event, pdMS_TO_TICKS(500))) {
             cb_event = GDO_CB_EVENT_MAX;
 
             switch ((int)event.gdo_event) {
             case UART_BREAK:
                 // All messages from the GDO start with a break if using V2 protocol.
+                if (dbg_uart_break_seen < 5) {
+                    gdolib_esphome_log_e(TAG, "UART_BREAK proto=%d rx_pending(before)=%u", (int)g_status.protocol, rx_pending);
+                    ++dbg_uart_break_seen;
+                }
                 if (g_status.protocol == GDO_PROTOCOL_SEC_PLUS_V2) {
                     ++rx_pending;
                 }
                 break;
             case UART_DATA: {
                 uint16_t rx_packet_size = event.uart_event.size;
+                if (dbg_uart_data_seen < 5) {
+                    gdolib_esphome_log_e(TAG, "UART_DATA size=%u rx_pending(before)=%u proto=%d", rx_packet_size, rx_pending, (int)g_status.protocol);
+                    ++dbg_uart_data_seen;
+                }
                 if (!g_status.protocol) {
                     if (rx_packet_size == 2) {
                         ESP_LOGD(TAG, "Received 2 bytes, using protocol V1");
@@ -1468,6 +1577,8 @@ static void gdo_main_task(void* arg) {
                 }
 
                 if (g_status.protocol == GDO_PROTOCOL_SEC_PLUS_V2) {
+                    bool oversized_v2_handled = false;
+
                     if (!rx_pending) {
                         // got a packet without a break first?
                         ESP_LOGI(TAG, "Unexpected data; received %u bytes, %s", rx_packet_size,
@@ -1487,37 +1598,99 @@ static void gdo_main_task(void* arg) {
                         break;
                     }
 
-                    if (rx_packet_size > GDO_PACKET_SIZE) {
-                        ESP_LOGW(TAG, "Oversized packet received: %u bytes, messages pending: %u", rx_packet_size, rx_pending);
-                        // Sometimes the break is interperated as a 0 byte and added to the packet
-                        // So lets just dump the first byte(s) until we have our packet size.
-                        while (rx_packet_size > GDO_PACKET_SIZE) {
-                            if (uart_read_bytes(g_config.uart_num, rx_buffer, 1, 0) < 0) {
-                                ESP_LOGI(TAG, "RX buffer read error, flushing");
-                                uart_flush(g_config.uart_num);
-                                rx_pending = 0;
-                                break;
+                    if (rx_packet_size == GDO_PACKET_SIZE + 1) {
+                        /*
+                         * Exactly 20 bytes: one junk byte before the 19-byte wireline is common (0x00 break artifact,
+                         * or e.g. 0x38 after TX). Read once; frame at offset 0, or offset 1 if wireline decodes there.
+                         */
+                        int br = uart_read_bytes(g_config.uart_num, rx_buffer, rx_packet_size, 0);
+                        if (br < 0 || br != (int)rx_packet_size) {
+                            gdolib_esphome_log_e(TAG, "V2 20-byte read failed br=%d; flushing RX", br);
+                            uart_flush_input(g_config.uart_num);
+                            rx_pending = 0;
+                        } else {
+                            uint8_t *frame = NULL;
+                            if (memcmp(rx_buffer, "\x55\x01\x00", 3) == 0) {
+                                frame = rx_buffer;
+                            } else if (memcmp(rx_buffer + 1, "\x55\x01\x00", 3) == 0) {
+                                uint32_t rolling = 0;
+                                uint64_t fixed = 0;
+                                uint32_t data = 0;
+                                if (decode_wireline(rx_buffer + 1, &rolling, &fixed, &data) == 0) {
+                                    frame = rx_buffer + 1;
+                                }
                             }
-
-                            --rx_packet_size;
+                            if (frame != NULL) {
+                                if (dbg_v2_sig_ok < 5) {
+                                    gdolib_esphome_log_e(TAG, "V2 signature match; processing packet rx_pending=%u",
+                                                         rx_pending);
+                                    ++dbg_v2_sig_ok;
+                                }
+                                print_buffer(g_status.protocol, frame, false);
+                                decode_packet(frame);
+                                if (rx_pending > 0) {
+                                    --rx_pending;
+                                }
+                            } else {
+                                gdolib_esphome_log_w(TAG,
+                                                     "Oversized packet received: %u bytes, messages pending: %u",
+                                                     rx_packet_size, rx_pending);
+                                process_oversized_v2_chunk(rx_buffer, rx_packet_size, &rx_pending);
+                            }
                         }
+                        oversized_v2_handled = true;
+                    } else if (rx_packet_size > GDO_PACKET_SIZE + 1) {
+                        gdolib_esphome_log_w(TAG, "Oversized packet received: %u bytes, messages pending: %u",
+                                             rx_packet_size, rx_pending);
+                        if (rx_packet_size > (uint16_t)(RX_BUFFER_SIZE * 2)) {
+                            gdolib_esphome_log_e(TAG, "Oversized chunk %u exceeds rx_buffer %u; flushing UART RX",
+                                                 rx_packet_size, (unsigned)(RX_BUFFER_SIZE * 2));
+                            uart_flush_input(g_config.uart_num);
+                            rx_pending = 0;
+                        } else {
+                            int br = uart_read_bytes(g_config.uart_num, rx_buffer, rx_packet_size, 0);
+                            if (br < 0 || br != (int)rx_packet_size) {
+                                gdolib_esphome_log_e(TAG, "Oversized UART read failed br=%d expected=%u; flushing RX",
+                                                     br, rx_packet_size);
+                                uart_flush_input(g_config.uart_num);
+                                rx_pending = 0;
+                            } else {
+                                process_oversized_v2_chunk(rx_buffer, rx_packet_size, &rx_pending);
+                            }
+                        }
+                        oversized_v2_handled = true;
                     }
 
-                    while(rx_pending) {
-                        if (uart_read_bytes(g_config.uart_num, rx_buffer, GDO_PACKET_SIZE, 0) == GDO_PACKET_SIZE) {
-                            // check for the GDO packet start (0x55 0x01 0x00)
-                            if (memcmp(rx_buffer, "\x55\x01\x00", 3) != 0) {
-                                ESP_LOGE(TAG, "RX data signature error: 0x%02x%02x%02x", rx_buffer[0], rx_buffer[1], rx_buffer[2]);
-                                rx_pending--;
-                                continue;
-                            }
+                    if (!oversized_v2_handled) {
+                        while (rx_pending) {
+                            if (uart_read_bytes(g_config.uart_num, rx_buffer, GDO_PACKET_SIZE, 0) ==
+                                GDO_PACKET_SIZE) {
+                                if (memcmp(rx_buffer, "\x55\x01\x00", 3) != 0) {
+                                    if (dbg_v2_sig_err < 5) {
+                                        gdolib_esphome_log_e(TAG,
+                                                              "V2 signature mismatch first3=%02x%02x%02x rx_pending=%u packet_size=%lu",
+                                                              rx_buffer[0], rx_buffer[1], rx_buffer[2], rx_pending,
+                                                              (unsigned long)GDO_PACKET_SIZE);
+                                        ++dbg_v2_sig_err;
+                                    }
+                                    gdolib_esphome_log_e(TAG, "RX data signature error: 0x%02x%02x%02x",
+                                                         rx_buffer[0], rx_buffer[1], rx_buffer[2]);
+                                    rx_pending--;
+                                    continue;
+                                }
 
-                            print_buffer(g_status.protocol, rx_buffer, false);
-                            decode_packet(rx_buffer);
-                        } else {
-                            ESP_LOGE(TAG, "RX buffer read error, %u pending messages.", rx_pending);
+                                if (dbg_v2_sig_ok < 5) {
+                                    gdolib_esphome_log_e(TAG, "V2 signature match; processing packet rx_pending=%u",
+                                                         rx_pending);
+                                    ++dbg_v2_sig_ok;
+                                }
+                                print_buffer(g_status.protocol, rx_buffer, false);
+                                decode_packet(rx_buffer);
+                            } else {
+                                gdolib_esphome_log_e(TAG, "RX buffer read error, %u pending messages.", rx_pending);
+                            }
+                            --rx_pending;
                         }
-                        --rx_pending;
                     }
                 } else if (g_status.protocol & GDO_PROTOCOL_SEC_PLUS_V1) {
                     ESP_LOGV(TAG, "RX Secplus V1 data packet; %u bytes", rx_packet_size);
@@ -1687,6 +1860,24 @@ static void gdo_main_task(void* arg) {
 
             if (cb_event < GDO_CB_EVENT_MAX && g_event_callback) {
                 g_event_callback(&g_status, cb_event, g_user_cb_arg);
+            }
+
+            // Heartbeat: prove the task is alive even if the queue is busy.
+            // We check after processing any event so this can't be starved.
+            uint64_t now_us = esp_timer_get_time();
+            if (last_hb_us == 0 || (now_us - last_hb_us) > 15ULL * 1000000ULL) {
+                last_hb_us = now_us;
+                esp_rom_printf("gdolib ESPROM heartbeat: rx_pending=%u proto=%d\n", rx_pending, (int)g_status.protocol);
+                ESP_LOGE("gdolib", "heartbeat: rx_pending=%u proto=%d", rx_pending, (int)g_status.protocol);
+            }
+        } else {
+            // Heartbeat: prove the task is alive even if no UART frames arrive.
+            // Uses esp_rom_printf to bypass any ESPHome logger filtering.
+            uint64_t now_us = esp_timer_get_time();
+            if (last_hb_us == 0 || (now_us - last_hb_us) > 15ULL * 1000000ULL) {
+                last_hb_us = now_us;
+                esp_rom_printf("gdolib ESPROM heartbeat: rx_pending=%u proto=%d\n", rx_pending, (int)g_status.protocol);
+                ESP_LOGE("gdolib", "heartbeat: rx_pending=%u proto=%d", rx_pending, (int)g_status.protocol);
             }
         }
     }

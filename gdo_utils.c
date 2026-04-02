@@ -17,6 +17,7 @@
 
 #include "gdo.h"
 #include "gdo_priv.h"
+#include "gdo_esphome_log_bridge.h"
 
 const char *gdo_door_state_str[] = {
     "Unknown",
@@ -200,16 +201,25 @@ const char* v1_cmd_to_string(gdo_v1_command_t cmd) {
 }
 
 void print_buffer(gdo_protocol_type_t protocol, uint8_t* buf, bool is_tx) {
+    // One-time burst of high-signal logging to confirm print_buffer is reached.
+    static uint32_t dbg_print_buffer_seen = 0;
+    if (dbg_print_buffer_seen < 5) {
+        gdolib_esphome_log_e(TAG, "print_buffer %s proto=%d is_tx=%d first=%02x",
+                             "RXTX", (int)protocol, (int)is_tx, buf ? buf[0] : 0);
+        ++dbg_print_buffer_seen;
+    }
+
     if (protocol == GDO_PROTOCOL_SEC_PLUS_V2) {
-        ESP_LOGD(TAG, "%s: "
-                 "[%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X]",
-                 is_tx ? "TX" : "RX",
-                 buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8], buf[9],
-                 buf[10], buf[11], buf[12],buf[13], buf[14], buf[15], buf[16], buf[17], buf[18]);
+        gdolib_esphome_log_i(TAG,
+                              "%s: "
+                              "[%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X]",
+                              is_tx ? "TX" : "RX",
+                              buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8], buf[9],
+                              buf[10], buf[11], buf[12], buf[13], buf[14], buf[15], buf[16], buf[17], buf[18]);
     } else if (is_tx) {
-        ESP_LOGD(TAG, "TX [%02X]", buf[0]);
+        gdolib_esphome_log_i(TAG, "TX [%02X]", buf[0]);
     } else {
-        ESP_LOGD(TAG, "RX [%02X %02X]", buf[0], buf[1]);
+        gdolib_esphome_log_i(TAG, "RX [%02X %02X]", buf[0], buf[1]);
     }
 }
 

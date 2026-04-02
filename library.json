@@ -1,0 +1,14 @@
+{
+  "name": "gdolib",
+  "version": "0.0.0-local",
+  "headers": "gdo.h",
+  "frameworks": "espidf",
+  "platforms": "espressif32",
+  "build": {
+    "includeDir": "include",
+    "srcDir": ".",
+    "flags": [
+      "-Iinclude"
+    ]
+  }
+}
