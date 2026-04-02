@@ -1428,6 +1428,24 @@ static void decode_packet(uint8_t *packet) {
     }
 }
 
+/** Min interval between GET_STATUS after bad Sec+ v2 RX (avoids flooding the command queue). */
+#define GDO_V2_BAD_RX_GET_STATUS_INTERVAL_US (3ULL * 1000 * 1000)
+
+static uint64_t g_v2_last_bad_rx_get_status_us;
+
+static void v2_get_status_after_bad_rx(void) {
+    uint64_t now_us = esp_timer_get_time();
+    if (g_v2_last_bad_rx_get_status_us != 0 &&
+        now_us - g_v2_last_bad_rx_get_status_us < GDO_V2_BAD_RX_GET_STATUS_INTERVAL_US) {
+        return;
+    }
+    g_v2_last_bad_rx_get_status_us = now_us;
+    esp_err_t gst = get_status();
+    if (gst != ESP_OK) {
+        ESP_LOGD(TAG, "GET_STATUS after bad v2 RX failed: %s", esp_err_to_name(gst));
+    }
+}
+
 /**
  * @brief Main task that handles all the events from the UART and other tasks.
 */
@@ -1496,6 +1514,7 @@ static void gdo_main_task(void* arg) {
                                 ESP_LOGI(TAG, "RX buffer read error, flushing");
                                 uart_flush(g_config.uart_num);
                                 rx_pending = 0;
+                                v2_get_status_after_bad_rx();
                                 break;
                             }
 
@@ -1508,6 +1527,7 @@ static void gdo_main_task(void* arg) {
                             // check for the GDO packet start (0x55 0x01 0x00)
                             if (memcmp(rx_buffer, "\x55\x01\x00", 3) != 0) {
                                 ESP_LOGE(TAG, "RX data signature error: 0x%02x%02x%02x", rx_buffer[0], rx_buffer[1], rx_buffer[2]);
+                                v2_get_status_after_bad_rx();
                                 rx_pending--;
                                 continue;
                             }
@@ -1516,6 +1536,7 @@ static void gdo_main_task(void* arg) {
                             decode_packet(rx_buffer);
                         } else {
                             ESP_LOGE(TAG, "RX buffer read error, %u pending messages.", rx_pending);
+                            v2_get_status_after_bad_rx();
                         }
                         --rx_pending;
                     }
